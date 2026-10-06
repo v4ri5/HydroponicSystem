@@ -1,0 +1,8 @@
+# Arduino build files
+*.hex
+*.elf
+*.bin
+
+# OS-specific
+.DS_Store
+.vscode/
