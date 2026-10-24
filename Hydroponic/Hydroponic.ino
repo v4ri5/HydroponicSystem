@@ -2,12 +2,16 @@
 #include <DallasTemperature.h>
 #include <U8g2lib.h>
 
+
+// Add precision reaDINGS FOR TDS AND PH 
+
 // --- Pins ---
 const int TEMP_PIN      = 4;
 const int WATER_LEVEL   = 6;
 const int BACKLIGHT_PIN = 7;
-const int PH_PIN        = A1;  // not used yet
-const int TDS_PIN       = A2;  // not used yet
+const int PH_PIN        = A1;
+const int TDS_PIN       = A2;
+const int TDS_POWER_PIN = 5;// This has to have the VCC wire into the D pin in the 5 digital pin group
 
 // --- Display tuning ---
 const uint8_t CONTRAST = 30;    // tune 0-255 if the screen is blank or solid black
@@ -25,8 +29,10 @@ unsigned long lastSample = 0;
 const int SAMPLE_COUNT = 25;
 int phSamples[SAMPLE_COUNT];
 int tdsSamples[SAMPLE_COUNT];
-int sampleIndex  = 0;
-int samplesTaken = 0;
+int tdsCount = 0; 
+int phCount = 0;
+
+bool dataReady = false;
 
 const unsigned long READ_INTERVAL = 1000;  // ms between reads (must stay > 750)
 unsigned long lastRead = 0;
@@ -66,15 +72,25 @@ float voltsToPh(float volts) {
   return 7.0 + slope * (volts - PH_V7);
 }
 
+enum TDS_States {
+  TDS_Stablize,
+  TDS_Collection,
+  pH_Recover,
+  pH_Collection,
+};
+
+unsigned long stateStart = 0;
+TDS_States current = TDS_Stablize;
 
 void setup() {
+
   Serial.begin(9600);
 
   pinMode(WATER_LEVEL, INPUT_PULLUP);
-
   pinMode(BACKLIGHT_PIN, OUTPUT);
+  pinMode(TDS_POWER_PIN, OUTPUT);
   digitalWrite(BACKLIGHT_PIN, HIGH);   // if the backlight stays off, try LOW
-
+  digitalWrite(TDS_POWER_PIN, HIGH);
   sensors.begin();
   sensors.setWaitForConversion(false); // don't block ~750 ms on each request
   sensors.requestTemperatures();       // start the first conversion
@@ -88,20 +104,64 @@ void setup() {
 
   // Splash screen, shown until the first reading
   u8g2.clearBuffer();
-  u8g2.drawStr(0, 10, "Starting...");
+  u8g2.drawStr(0, 10, "STARTING....");
   u8g2.sendBuffer();
+
+
+  stateStart = millis();
 }
 
 void loop() {
-  if (millis() - lastSample >= SAMPLE_INTERVAL) {
-  lastSample = millis();
-  phSamples[sampleIndex]  = analogRead(PH_PIN);
-  tdsSamples[sampleIndex] = analogRead(TDS_PIN);
-  sampleIndex = (sampleIndex + 1) % SAMPLE_COUNT;
-  if (samplesTaken < SAMPLE_COUNT) samplesTaken++;
+    switch (current) {
+    case TDS_Stablize:
+      if (millis() - stateStart >= 1000){
+        current = TDS_Collection;
+        stateStart = millis();
+        Serial.println("Stablize -> Collection");
+      }
+      break;
+
+    case TDS_Collection:
+      if (millis() - lastSample >= SAMPLE_INTERVAL) {
+        lastSample = millis();
+        tdsSamples[tdsCount] = analogRead(TDS_PIN);
+        tdsCount++;
+      }
+      if (tdsCount >= SAMPLE_COUNT) {
+        tdsCount = 0;
+        digitalWrite(TDS_POWER_PIN, LOW);
+        stateStart = millis();
+        current = pH_Recover;
+        Serial.println("Collection -> Recover");
+      }
+      break;
+
+    case pH_Recover:
+      if (millis() - stateStart >= 5000) {
+        stateStart = millis();
+        current = pH_Collection;
+        Serial.println("Recover -> Collection");
+      }
+      break;
+
+    case pH_Collection:
+      if (millis() - lastSample >= SAMPLE_INTERVAL) {
+        lastSample = millis();
+        phSamples[phCount] = analogRead(PH_PIN);
+        phCount++;
+      }
+      if (phCount >= SAMPLE_COUNT) {
+        phCount = 0;
+        dataReady = true;
+        digitalWrite(TDS_POWER_PIN, HIGH);
+        stateStart = millis();
+        current = TDS_Stablize;
+        Serial.println("Collection -> Stablize");
+      }
+      break;
   }
 
-  if (millis() - lastRead >= READ_INTERVAL && samplesTaken > 0) {
+  if (millis() - lastRead >= READ_INTERVAL && dataReady > 0) {
     lastRead = millis();
 
     // Read the conversion started on the previous tick, then start the next one
@@ -110,8 +170,8 @@ void loop() {
 
     bool probeOk = (tempC != DEVICE_DISCONNECTED_C);
     bool level   = digitalRead(WATER_LEVEL);
-    float phVolts  = toVolts(medianOf(phSamples, samplesTaken));
-    float tdsVolts = toVolts(medianOf(tdsSamples, samplesTaken));
+    float phVolts  = toVolts(medianOf(phSamples, SAMPLE_COUNT));
+    float tdsVolts = toVolts(medianOf(tdsSamples, SAMPLE_COUNT));
     float compTemp = probeOk ? tempC : 25.0;
     float tds = voltsToTds(tdsVolts, compTemp);
     float ph  = voltsToPh(phVolts);
