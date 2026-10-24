@@ -1,9 +1,26 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <U8g2lib.h>
-
+#include <Servo.h>
 
 // Add precision reaDINGS FOR TDS AND PH 
+
+
+// Green Onion Parameters 
+//ph Range 5.5 - 6.5
+// Nutrients Strength 700ppm - 1200 ppm
+// Temp Range 13-24 C
+
+
+const float PH_LOWER = 5.5;
+const float PH_UPPER = 6.5;
+const int NutrientsUpperBound = 1200;
+const int NutrientsLowerBound = 700;
+const int TempRangeUpper = 24;
+const int TempRangeLower = 13;
+
+///
+
 
 // --- Pins ---
 const int TEMP_PIN      = 4;
@@ -12,6 +29,11 @@ const int BACKLIGHT_PIN = 7;
 const int PH_PIN        = A1;
 const int TDS_PIN       = A2;
 const int TDS_POWER_PIN = 5;// This has to have the VCC wire into the D pin in the 5 digital pin group
+const int PERISTALTIC_PUMP = 3;
+const int PUMP_STOP = 1500;   // stop band center
+const int PUMP_RUN  = 1000;   // forward, medium speed; 500 = full speed
+
+
 
 // --- Display tuning ---
 const uint8_t CONTRAST = 30;    // tune 0-255 if the screen is blank or solid black
@@ -19,9 +41,15 @@ const uint8_t CONTRAST = 30;    // tune 0-255 if the screen is blank or solid bl
 const float ADC_VREF = 5.0;
 const float ADC_MAX  = 1023.0;
 
-const bool  PH_CALIBRATED = false;
-const float PH_V7 = 1.50;   // volts in pH 7 buffer
-const float PH_V4 = 2.03;   // volts in pH 4 buffer
+const bool  PH_CALIBRATED = true;
+const float PH_V7 = 1.63;   // volts in pH 7 buffer
+const float PH_V4 = 2.18;   // volts in pH 4 buffer
+
+
+const unsigned long DOSE_MS     = 1500;          // pump run time per dose
+const unsigned long MIX_MS      = 30000;        // 10 min mixing wait (use 30000 while testing)
+const int MAX_DOSES_IN_A_ROW    = 5;             // lockout if TDS never recovers
+
 
 const unsigned long SAMPLE_INTERVAL = 40;
 unsigned long lastSample = 0;
@@ -31,8 +59,11 @@ int phSamples[SAMPLE_COUNT];
 int tdsSamples[SAMPLE_COUNT];
 int tdsCount = 0; 
 int phCount = 0;
+float tdsValue = 0;
+float phValue  = 0;
 
 bool dataReady = false;
+bool valuesReady = false;
 
 const unsigned long READ_INTERVAL = 1000;  // ms between reads (must stay > 750)
 unsigned long lastRead = 0;
@@ -40,7 +71,7 @@ unsigned long lastRead = 0;
 OneWire oneWire(TEMP_PIN);
 DallasTemperature sensors(&oneWire);
 U8G2_ST7565_NHD_C12864_F_4W_HW_SPI u8g2(U8G2_R2, /* cs */ 10, /* dc */ 9, /* reset */ 8);
-
+Servo pump;
 
 int medianOf(const int *src, int n) {
   int tmp[SAMPLE_COUNT];
@@ -79,6 +110,19 @@ enum TDS_States {
   pH_Collection,
 };
 
+
+enum DoseState {
+  DOSE_IDLE,
+  DOSE_RUNNING,
+  DOSE_MIXING,
+  DOSE_LOCKOUT
+};
+
+DoseState doseState = DOSE_IDLE;
+unsigned long doseStart = 0;
+int dosesInARow = 0;
+
+
 unsigned long stateStart = 0;
 TDS_States current = TDS_Stablize;
 
@@ -91,6 +135,10 @@ void setup() {
   pinMode(TDS_POWER_PIN, OUTPUT);
   digitalWrite(BACKLIGHT_PIN, HIGH);   // if the backlight stays off, try LOW
   digitalWrite(TDS_POWER_PIN, HIGH);
+
+  pump.attach(PERISTALTIC_PUMP);
+  pump.writeMicroseconds(PUMP_STOP);
+  
   sensors.begin();
   sensors.setWaitForConversion(false); // don't block ~750 ms on each request
   sensors.requestTemperatures();       // start the first conversion
@@ -161,6 +209,50 @@ void loop() {
       break;
   }
 
+    // --- Nutrient dosing ---
+  bool waterOk = (digitalRead(WATER_LEVEL) == HIGH);   // VERIFY: HIGH must mean normal level
+
+  switch (doseState) {
+    case DOSE_IDLE:
+      if (valuesReady && waterOk) {
+        if (tdsValue < NutrientsLowerBound) {
+          pump.writeMicroseconds(PUMP_RUN);
+          doseStart = millis();
+          dosesInARow++;
+          doseState = DOSE_RUNNING;
+          Serial.println("Dose: IDLE -> RUNNING");
+        } else {
+          dosesInARow = 0;   // TDS is in range, reset the counter
+        }
+      }
+      break;
+
+    case DOSE_RUNNING:
+      if (!waterOk || millis() - doseStart >= DOSE_MS) {
+        pump.writeMicroseconds(PUMP_STOP);
+        doseStart = millis();
+        doseState = DOSE_MIXING;
+        Serial.println("Dose: RUNNING -> MIXING");
+      }
+      break;
+
+    case DOSE_MIXING:
+      if (millis() - doseStart >= MIX_MS) {
+        if (dosesInARow >= MAX_DOSES_IN_A_ROW) {
+          doseState = DOSE_LOCKOUT;
+          Serial.println("Dose: LOCKOUT - TDS not rising, check nutrient bottle/tubing");
+        } else {
+          doseState = DOSE_IDLE;
+          Serial.println("Dose: MIXING -> IDLE");
+        }
+      }
+      break;
+
+    case DOSE_LOCKOUT:
+      // Stays here until reset; refill the bottle, then press the board's reset button
+      break;
+  }
+
   if (millis() - lastRead >= READ_INTERVAL && dataReady > 0) {
     lastRead = millis();
 
@@ -173,8 +265,11 @@ void loop() {
     float phVolts  = toVolts(medianOf(phSamples, SAMPLE_COUNT));
     float tdsVolts = toVolts(medianOf(tdsSamples, SAMPLE_COUNT));
     float compTemp = probeOk ? tempC : 25.0;
-    float tds = voltsToTds(tdsVolts, compTemp);
-    float ph  = voltsToPh(phVolts);
+    tdsValue = voltsToTds(tdsVolts, compTemp);
+    phValue  = voltsToPh(phVolts);
+    valuesReady = true; 
+
+   
     
     // --- Serial output ---
     Serial.println(level ? "WATER LEVEL HIGH" : "WATER LEVEL LOW");
@@ -204,13 +299,13 @@ void loop() {
     u8g2.print(level ? "HIGH" : "LOW");
     u8g2.drawStr(0, 40, "TDS:");
     u8g2.setCursor(50, 40);
-    u8g2.print(tds, 0);
+    u8g2.print(tdsValue, 0);
     u8g2.print(" ppm");
 
     u8g2.drawStr(0, 55, "pH:");
     u8g2.setCursor(50, 55);
     if (PH_CALIBRATED) {
-      u8g2.print(ph, 2);
+      u8g2.print(phValue, 2);
     } else {
       u8g2.print(phVolts, 2);
       u8g2.print(" V");
